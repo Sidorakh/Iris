@@ -23,7 +23,6 @@ import net.coderbot.iris.gl.program.ProgramImages;
 import net.coderbot.iris.gl.program.ProgramSamplers;
 import net.coderbot.iris.gl.shader.ShaderType;
 import net.coderbot.iris.gl.texture.DepthBufferFormat;
-import net.coderbot.iris.gl.texture.InternalTextureFormat;
 import net.coderbot.iris.layer.GbufferPrograms;
 import net.coderbot.iris.mixin.LevelRendererAccessor;
 import net.coderbot.iris.pipeline.patcher.AttributeShaderTransformer;
@@ -36,6 +35,7 @@ import net.coderbot.iris.rendertarget.NativeImageBackedSingleColorTexture;
 import net.coderbot.iris.rendertarget.RenderTargets;
 import net.coderbot.iris.samplers.IrisImages;
 import net.coderbot.iris.samplers.IrisSamplers;
+import net.coderbot.iris.shaderpack.CloudSetting;
 import net.coderbot.iris.shaderpack.IdMap;
 import net.coderbot.iris.shaderpack.PackDirectives;
 import net.coderbot.iris.shaderpack.PackShadowDirectives;
@@ -57,7 +57,6 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.DimensionSpecialEffects;
 import net.minecraft.client.renderer.texture.AbstractTexture;
 import org.jetbrains.annotations.Nullable;
-import org.lwjgl.opengl.GL11C;
 import org.lwjgl.opengl.GL15C;
 import org.lwjgl.opengl.GL20C;
 import org.lwjgl.opengl.GL30C;
@@ -86,8 +85,8 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 
 	private final ImmutableList<ClearPass> clearPassesFull;
 	private final ImmutableList<ClearPass> clearPasses;
-
-	private final GlFramebuffer baseline;
+	private final ImmutableList<ClearPass> shadowClearPasses;
+	private final ImmutableList<ClearPass> shadowClearPassesFull;
 
 	private final CompositeRenderer prepareRenderer;
 
@@ -112,11 +111,14 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 	private final HorizonRenderer horizonRenderer = new HorizonRenderer();
 
 	private final float sunPathRotation;
-	private final boolean shouldRenderClouds;
+	private final CloudSetting cloudSetting;
 	private final boolean shouldRenderUnderwaterOverlay;
 	private final boolean shouldRenderVignette;
+	private final boolean shouldRenderSun;
+	private final boolean shouldRenderMoon;
 	private final boolean shouldWriteRainAndSnowToDepthBuffer;
 	private final boolean shouldRenderParticlesBeforeDeferred;
+	private final boolean shouldRenderPrepareBeforeShadow;
 	private final boolean oldLighting;
 	private final OptionalInt forcedShadowRenderDistanceChunks;
 
@@ -131,11 +133,14 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 	public DeferredWorldRenderingPipeline(ProgramSet programs) {
 		Objects.requireNonNull(programs);
 
-		this.shouldRenderClouds = programs.getPackDirectives().areCloudsEnabled();
+		this.cloudSetting = programs.getPackDirectives().getCloudSetting();
 		this.shouldRenderUnderwaterOverlay = programs.getPackDirectives().underwaterOverlay();
 		this.shouldRenderVignette = programs.getPackDirectives().vignette();
+		this.shouldRenderSun = programs.getPackDirectives().shouldRenderSun();
+		this.shouldRenderMoon = programs.getPackDirectives().shouldRenderMoon();
 		this.shouldWriteRainAndSnowToDepthBuffer = programs.getPackDirectives().rainDepth();
 		this.shouldRenderParticlesBeforeDeferred = programs.getPackDirectives().areParticlesBeforeDeferred();
+		this.shouldRenderPrepareBeforeShadow = programs.getPackDirectives().isPrepareBeforeShadow();
 		this.oldLighting = programs.getPackDirectives().isOldLighting();
 		this.updateNotifier = new FrameUpdateNotifier();
 
@@ -194,12 +199,7 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 
 		this.shadowTargetsSupplier = () -> {
 			if (shadowRenderTargets == null) {
-				// TODO: Support more than two shadowcolor render targets
-				this.shadowRenderTargets = new ShadowRenderTargets(shadowMapResolution, new InternalTextureFormat[]{
-					// TODO: Custom shadowcolor format support
-					InternalTextureFormat.RGBA,
-					InternalTextureFormat.RGBA
-				});
+				this.shadowRenderTargets = new ShadowRenderTargets(shadowMapResolution, shadowDirectives);
 			}
 
 			return shadowRenderTargets;
@@ -293,7 +293,12 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 					return createDefaultPass();
 				}
 
-				return createPass(source, availability, condition == RenderCondition.SHADOW);
+				try {
+					return createPass(source, availability, condition == RenderCondition.SHADOW);
+				} catch (Exception e) {
+					throw new RuntimeException("Failed to create pass for " + source.getName() + " for rendering condition "
+						+ condition + " specialized to input availability " + availability, e);
+				}
 			});
 		});
 
@@ -302,15 +307,17 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 		this.clearPasses = ClearPassCreator.createClearPasses(renderTargets, false,
 				programs.getPackDirectives().getRenderTargetDirectives());
 
-		this.baseline = renderTargets.createGbufferFramebuffer(ImmutableSet.of(), new int[] {0});
-
 		if (shadowRenderTargets != null) {
 			Program shadowProgram = table.match(RenderCondition.SHADOW, new InputAvailability(true, true, true)).getProgram();
 			boolean shadowUsesImages = shadowProgram != null && shadowProgram.getActiveImages() > 0;
+			this.shadowClearPasses = ClearPassCreator.createShadowClearPasses(shadowRenderTargets, false, shadowDirectives);
+			this.shadowClearPassesFull = ClearPassCreator.createShadowClearPasses(shadowRenderTargets, true, shadowDirectives);
 
 			this.shadowRenderer = new ShadowRenderer(programs.getShadow().orElse(null),
 				programs.getPackDirectives(), shadowRenderTargets, shadowUsesImages);
 		} else {
+			this.shadowClearPasses = ImmutableList.of();
+			this.shadowClearPassesFull = ImmutableList.of();
 			this.shadowRenderer = null;
 		}
 
@@ -403,8 +410,8 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 	}
 
 	@Override
-	public boolean shouldRenderClouds() {
-		return shouldRenderClouds;
+	public CloudSetting getCloudSetting() {
+		return cloudSetting;
 	}
 
 	@Override
@@ -415,6 +422,16 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 	@Override
 	public boolean shouldRenderVignette() {
 		return shouldRenderVignette;
+	}
+
+	@Override
+	public boolean shouldRenderSun() {
+		return shouldRenderSun;
+	}
+
+	@Override
+	public boolean shouldRenderMoon() {
+		return shouldRenderMoon;
 	}
 
 	@Override
@@ -535,20 +552,18 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 
 	private Pass createPass(ProgramSource source, InputAvailability availability, boolean shadow) {
 		// TODO: Properly handle empty shaders
-		String geometry = source.getGeometrySource().orElse(null);
+		String geometry = null;
+		if (source.getGeometrySource().isPresent()) {
+			geometry = AttributeShaderTransformer.patch(source.getGeometrySource().orElse(null),
+				ShaderType.GEOMETRY, true, availability);
+		}
 		String vertex = AttributeShaderTransformer.patch(source.getVertexSource().orElseThrow(NullPointerException::new),
 				ShaderType.VERTEX, geometry != null, availability);
 		String fragment = AttributeShaderTransformer.patch(source.getFragmentSource().orElseThrow(NullPointerException::new),
 				ShaderType.FRAGMENT, geometry != null, availability);
 
-		ProgramBuilder builder;
-		try {
-			builder = ProgramBuilder.begin(source.getName(), vertex, geometry,
-					fragment, IrisSamplers.WORLD_RESERVED_TEXTURE_UNITS);
-		} catch (RuntimeException e) {
-			// TODO: Better error handling
-			throw new RuntimeException("Shader compilation failed!", e);
-		}
+		ProgramBuilder builder = ProgramBuilder.begin(source.getName(), vertex, geometry,
+				fragment, IrisSamplers.WORLD_RESERVED_TEXTURE_UNITS);
 
 		return createPassInner(builder, source.getParent().getPack().getIdMap(), source.getDirectives(), source.getParent().getPackDirectives(), availability, shadow);
 	}
@@ -561,7 +576,7 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 		Supplier<ImmutableSet<Integer>> flipped;
 
 		if (shadow) {
-			flipped = () -> flippedBeforeShadow;
+			flipped = () -> (shouldRenderPrepareBeforeShadow ? flippedAfterPrepare : flippedBeforeShadow);
 		} else {
 			flipped = () -> isBeforeTranslucent ? flippedAfterPrepare : flippedAfterTranslucent;
 		}
@@ -611,6 +626,7 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 		builder.bindAttributeLocation(11, "mc_Entity");
 		builder.bindAttributeLocation(12, "mc_midTexCoord");
 		builder.bindAttributeLocation(13, "at_tangent");
+		builder.bindAttributeLocation(14, "at_midBlock");
 
 		AlphaTestOverride alphaTestOverride = programDirectives.getAlphaTestOverride().orElse(null);
 
@@ -785,14 +801,19 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 		RenderSystem.activeTexture(GL15C.GL_TEXTURE0);
 
 		if (shadowRenderTargets != null) {
-			// NB: This will be re-bound to the correct framebuffer in beginLevelRendering when matchPass is called.
-			shadowRenderTargets.getFramebuffer().bind();
+			Vector4f emptyClearColor = new Vector4f(1.0F);
+			ImmutableList<ClearPass> passes;
 
-			// TODO: Support shadow clear color directives & disable buffer clearing
-			// Ensure that the color and depth values are cleared appropriately
-			RenderSystem.clearColor(1.0f, 1.0f, 1.0f, 1.0f);
-			RenderSystem.clearDepth(1.0f);
-			RenderSystem.clear(GL11C.GL_DEPTH_BUFFER_BIT | GL11C.GL_COLOR_BUFFER_BIT, false);
+			if (shadowRenderTargets.needsFullClear()) {
+				passes = shadowClearPassesFull;
+				shadowRenderTargets.resetClearStatus();
+			} else {
+				passes = shadowClearPasses;
+			}
+
+			for (ClearPass clearPass : passes) {
+				clearPass.execute(emptyClearColor);
+			}
 		}
 
 		RenderTarget main = Minecraft.getInstance().getMainRenderTarget();
@@ -823,6 +844,9 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 		for (ClearPass clearPass : passes) {
 			clearPass.execute(fogColor);
 		}
+
+		// Reset framebuffer and viewport
+		Minecraft.getInstance().getMainRenderTarget().bindWrite(true);
 	}
 
 	@Override
@@ -865,6 +889,14 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 
 	@Override
 	public void renderShadows(LevelRendererAccessor levelRenderer, Camera playerCamera) {
+		if (shouldRenderPrepareBeforeShadow) {
+			isRenderingFullScreenPass = true;
+
+			prepareRenderer.renderAll();
+
+			isRenderingFullScreenPass = false;
+		}
+
 		if (shadowRenderer != null) {
 			isRenderingShadow = true;
 
@@ -875,11 +907,13 @@ public class DeferredWorldRenderingPipeline implements WorldRenderingPipeline, R
 			isRenderingShadow = false;
 		}
 
-		isRenderingFullScreenPass = true;
+		if (!shouldRenderPrepareBeforeShadow) {
+			isRenderingFullScreenPass = true;
 
-		prepareRenderer.renderAll();
+			prepareRenderer.renderAll();
 
-		isRenderingFullScreenPass = false;
+			isRenderingFullScreenPass = false;
+		}
 	}
 
 	@Override
