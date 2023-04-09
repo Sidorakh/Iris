@@ -652,6 +652,7 @@ public class ShadowRenderer {
 	}
 
 	public void addDebugText(List<String> messages) {
+		/*
 		if (IrisVideoSettings.getOverriddenShadowDistance(IrisVideoSettings.shadowDistance) == 0) {
 			messages.add("[" + Iris.MODNAME + "] Shadow Maps: off, shadow distance 0");
 			return;
@@ -675,6 +676,7 @@ public class ShadowRenderer {
 			messages.add("[" + Iris.MODNAME + "] E: " + renderedShadowEntities);
 			messages.add("[" + Iris.MODNAME + "] BE: " + renderedShadowBlockEntities);
 		}
+		*/
 	}
 
 	private String getEntitiesDebugString() {
